@@ -78,7 +78,9 @@ def backup_file(source: Path, root: Path, backup_root: Path) -> Path:
     return destination
 
 
-def process_file(path: Path, root: Path, backup_root: Path, apply: bool) -> tuple[str, str]:
+def process_file(
+    path: Path, root: Path, backup_root: Path, apply: bool
+) -> tuple[str, str]:
     try:
         tags = ID3(path)
     except ID3NoHeaderError:
@@ -110,13 +112,49 @@ def process_file(path: Path, root: Path, backup_root: Path, apply: bool) -> tupl
 
     try:
         backup_path = backup_file(path, root, backup_root)
+
+        # Apply the text repairs.
         for frame, index, _original, repaired in changes:
             frame.text[index] = repaired
+
+        # Some existing ID3 text frames are marked as Latin-1 (encoding=0).
+        # If their text contains characters outside Latin-1, saving can fail.
+        # Use UTF-8 encoding for text frames that cannot be represented in Latin-1.
+        for frame in tags.values():
+            frame_text = getattr(frame, "text", None)
+            if not isinstance(frame_text, list):
+                continue
+            needs_unicode = any(
+                isinstance(value, str)
+                and _not_latin1_encodable(value)
+                for value in frame_text
+            )
+            if needs_unicode and hasattr(frame, "encoding"):
+                frame.encoding = 3  # UTF-8, supported by ID3v2.4
+
         tags.save(path, v2_version=4)
     except Exception as exc:
-        return "ERROR", f"{type(exc).__name__}: {exc}"
+        diagnostic = [f"{type(exc).__name__}: {exc}"]
+        try:
+            for frame in tags.values():
+                frame_text = getattr(frame, "text", None)
+                if isinstance(frame_text, list) and frame_text:
+                    diagnostic.append(f"{frame.FrameID}: {frame_text!r}")
+        except Exception as frame_exc:
+            diagnostic.append(
+                f"Could not inspect frames: {type(frame_exc).__name__}: {frame_exc}"
+            )
+        return "ERROR", "Save failed: " + " | ".join(diagnostic)
 
     return "FIXED", f"Backup: {backup_path}; {description}"
+
+
+def _not_latin1_encodable(text: str) -> bool:
+    try:
+        text.encode("latin-1")
+        return False
+    except UnicodeEncodeError:
+        return True
 
 
 def main() -> int:
@@ -126,10 +164,18 @@ def main() -> int:
             "misinterpreted as Latin-1. Dry-run is the default."
         )
     )
-    parser.add_argument("directory", type=Path, help="Root directory to scan recursively")
+    parser.add_argument(
+        "directory", type=Path, help="Root directory to scan recursively"
+    )
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--apply", action="store_true", help="Save repaired tags and create backups")
-    mode.add_argument("--dry-run", action="store_true", help="Preview changes only (default)")
+    mode.add_argument(
+        "--apply", action="store_true",
+        help="Save repaired tags and create backups"
+    )
+    mode.add_argument(
+        "--dry-run", action="store_true",
+        help="Preview changes only (default)"
+    )
     args = parser.parse_args()
 
     root = args.directory.expanduser().resolve()
